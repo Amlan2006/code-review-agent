@@ -2,7 +2,7 @@ import hashlib
 import hmac
 import unittest
 
-from server import has_source_of_truth_deviation, parse_resolved_prior_issues, verify_github_signature
+from server import Settings, has_source_of_truth_deviation, parse_resolved_prior_issues, verify_github_signature
 
 
 class ServerTests(unittest.TestCase):
@@ -24,6 +24,10 @@ class ServerTests(unittest.TestCase):
         report = "RESOLVED_PRIOR_ISSUES: auth regression; missing tests\n"
         self.assertEqual(parse_resolved_prior_issues(report), ["auth regression", "missing tests"])
         self.assertEqual(parse_resolved_prior_issues("RESOLVED_PRIOR_ISSUES: none\n"), [])
+
+    def test_default_review_provider_is_codex(self):
+        settings = Settings.load()
+        self.assertIn(settings.review_provider, {"codex", "claude"})
 
 
 if __name__ == "__main__":

@@ -38,9 +38,12 @@ class Settings:
     default_branch: str
     data_dir: Path
     source_of_truth_file: str
+    review_provider: str
     codex_bin: str
     codex_model: str
-    codex_timeout_seconds: int
+    claude_bin: str
+    claude_model: str
+    review_timeout_seconds: int
     max_prior_reports: int
     telegram_bot_token: str
     telegram_chat_id: str
@@ -57,9 +60,12 @@ class Settings:
             default_branch=os.getenv("DEFAULT_BRANCH", "main"),
             data_dir=Path(os.getenv("DATA_DIR", "./data")).resolve(),
             source_of_truth_file=os.getenv("SOURCE_OF_TRUTH_FILE", "SOURCE_OF_TRUTH.md"),
+            review_provider=os.getenv("REVIEW_PROVIDER", "codex").strip().lower(),
             codex_bin=os.getenv("CODEX_BIN", "codex"),
             codex_model=os.getenv("CODEX_MODEL", ""),
-            codex_timeout_seconds=int(os.getenv("CODEX_TIMEOUT_SECONDS", "900")),
+            claude_bin=os.getenv("CLAUDE_BIN", "claude"),
+            claude_model=os.getenv("CLAUDE_MODEL", ""),
+            review_timeout_seconds=int(os.getenv("REVIEW_TIMEOUT_SECONDS", os.getenv("CODEX_TIMEOUT_SECONDS", "900"))),
             max_prior_reports=int(os.getenv("MAX_PRIOR_REPORTS", "8")),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -193,7 +199,7 @@ class ReviewAgent:
             bug_dir.mkdir(parents=True, exist_ok=True)
 
             prior_context = self.collect_prior_reports(event)
-            review_md = self.run_codex_review(event, repo_path, prior_context)
+            review_md = self.run_ai_review(event, repo_path, prior_context)
             deviation = has_source_of_truth_deviation(review_md)
             resolved = parse_resolved_prior_issues(review_md)
 
@@ -228,6 +234,7 @@ class ReviewAgent:
                         "delivery_id": event.delivery_id,
                         "repository": event.full_name,
                         "commit": event.after,
+                        "review_provider": self.settings.review_provider,
                         "processed_at": dt.datetime.now(dt.UTC).isoformat(),
                         "general_report": str(general_path),
                         "bug_report": str(bug_path) if bug_path else None,
@@ -287,14 +294,21 @@ class ReviewAgent:
             snippets.append(f"## Prior report: {path.parent.name}/{path.name}\n\n{text[:12000]}")
         return "\n\n---\n\n".join(snippets) or "No prior reports exist for this repository."
 
-    def run_codex_review(self, event: PushEvent, repo_path: Path, prior_context: str) -> str:
+    def run_ai_review(self, event: PushEvent, repo_path: Path, prior_context: str) -> str:
         source_path = repo_path / self.settings.source_of_truth_file
         if not source_path.exists():
             raise FileNotFoundError(f"source-of-truth file not found: {self.settings.source_of_truth_file}")
 
         diff = self.commit_diff(repo_path, event)
         prompt = build_review_prompt(event, self.settings.source_of_truth_file, diff, prior_context)
+        provider = self.settings.review_provider
+        if provider == "codex":
+            return self.run_codex_review(repo_path, prompt)
+        if provider == "claude":
+            return self.run_claude_review(repo_path, prompt)
+        raise ValueError(f"unsupported REVIEW_PROVIDER={provider!r}; expected 'codex' or 'claude'")
 
+    def run_codex_review(self, repo_path: Path, prompt: str) -> str:
         with tempfile.NamedTemporaryFile("w+", suffix=".md", delete=False, encoding="utf-8") as output:
             output_path = Path(output.name)
 
@@ -318,7 +332,7 @@ class ReviewAgent:
                 input=prompt,
                 text=True,
                 capture_output=True,
-                timeout=self.settings.codex_timeout_seconds,
+                timeout=self.settings.review_timeout_seconds,
             )
             if result.returncode != 0:
                 stderr = result.stderr.strip() or result.stdout.strip() or "no Codex output"
@@ -329,6 +343,33 @@ class ReviewAgent:
 
         if not review:
             raise RuntimeError("Codex returned an empty review")
+        return review + "\n"
+
+    def run_claude_review(self, repo_path: Path, prompt: str) -> str:
+        cmd = [
+            self.settings.claude_bin,
+            "--print",
+            "--output-format",
+            "text",
+        ]
+        if self.settings.claude_model:
+            cmd.extend(["--model", self.settings.claude_model])
+
+        result = subprocess.run(
+            cmd,
+            cwd=str(repo_path),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            timeout=self.settings.review_timeout_seconds,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip() or "no Claude output"
+            raise RuntimeError(f"Claude CLI failed with exit {result.returncode}: {stderr[-4000:]}")
+
+        review = result.stdout.strip()
+        if not review:
+            raise RuntimeError("Claude returned an empty review")
         return review + "\n"
 
     def commit_diff(self, repo_path: Path, event: PushEvent) -> str:
@@ -406,7 +447,7 @@ def file_field(boundary: str, name: str, filename: str, content_type: str, data:
 
 
 def build_review_prompt(event: PushEvent, source_file: str, diff: str, prior_context: str) -> str:
-    return f"""You are Codex performing an automated repository review.
+    return f"""You are an automated code review agent performing a repository review.
 
 Review the current checked-out repository at commit {event.after}.
 
@@ -539,8 +580,14 @@ def main() -> None:
     settings = Settings.load(Path(args.env_file))
     if settings.github_webhook_secret == "":
         print("WARNING: GITHUB_WEBHOOK_SECRET is empty; webhook signatures will not be enforced.", flush=True)
-    if shutil.which(settings.codex_bin) is None and not Path(settings.codex_bin).exists():
-        raise SystemExit(f"Codex executable not found: {settings.codex_bin}")
+    if settings.review_provider == "codex":
+        if shutil.which(settings.codex_bin) is None and not Path(settings.codex_bin).exists():
+            raise SystemExit(f"Codex executable not found: {settings.codex_bin}")
+    elif settings.review_provider == "claude":
+        if shutil.which(settings.claude_bin) is None and not Path(settings.claude_bin).exists():
+            raise SystemExit(f"Claude executable not found: {settings.claude_bin}")
+    else:
+        raise SystemExit("REVIEW_PROVIDER must be 'codex' or 'claude'")
 
     server = build_server(settings)
     print(f"Listening on http://{settings.host}:{settings.port}/webhook/github", flush=True)
