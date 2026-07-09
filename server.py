@@ -315,14 +315,16 @@ class ReviewAgent:
             cmd[2:2] = ["-m", self.settings.codex_model]
 
         try:
-            subprocess.run(
+            result = subprocess.run(
                 cmd,
                 input=prompt,
                 text=True,
                 capture_output=True,
                 timeout=self.settings.codex_timeout_seconds,
-                check=True,
             )
+            if result.returncode != 0:
+                stderr = result.stderr.strip() or result.stdout.strip() or "no Codex output"
+                raise RuntimeError(f"Codex CLI failed with exit {result.returncode}: {stderr[-4000:]}")
             review = output_path.read_text(encoding="utf-8", errors="replace").strip()
         finally:
             output_path.unlink(missing_ok=True)
