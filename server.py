@@ -305,8 +305,6 @@ class ReviewAgent:
             str(repo_path),
             "-s",
             "read-only",
-            "-a",
-            "never",
             "--output-last-message",
             str(output_path),
             "-",
